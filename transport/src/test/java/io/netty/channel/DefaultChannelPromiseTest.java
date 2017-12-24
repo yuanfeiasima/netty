@@ -16,6 +16,7 @@
 package io.netty.channel;
 
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.util.concurrent.ImmediateEventExecutor;
 import org.junit.Test;
 
 public class DefaultChannelPromiseTest {
@@ -28,5 +29,10 @@ public class DefaultChannelPromiseTest {
     @Test(expected = NullPointerException.class)
     public void testChannelWithNullExecutor() {
         new DefaultChannelPromise(new EmbeddedChannel(), null);
+    }
+
+    @Test(expected = NullPointerException.class)
+    public void testNullChannelWithExecutor() {
+        new DefaultChannelPromise(null, ImmediateEventExecutor.INSTANCE);
     }
 }

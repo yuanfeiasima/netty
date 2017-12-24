@@ -50,7 +50,7 @@ public class DefaultChannelPromise extends DefaultPromise<Void> implements Chann
      */
     public DefaultChannelPromise(Channel channel, EventExecutor executor) {
         super(executor);
-        this.channel = channel;
+        this.channel = checkNotNull(channel, "channel");
     }
 
     @Override
