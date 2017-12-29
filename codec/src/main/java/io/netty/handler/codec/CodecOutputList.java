@@ -16,8 +16,11 @@
 package io.netty.handler.codec;
 
 import io.netty.util.Recycler;
+import io.netty.util.concurrent.FastThreadLocal;
+import io.netty.util.internal.MathUtil;
 
 import java.util.AbstractList;
+import java.util.ArrayDeque;
 import java.util.RandomAccess;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
@@ -30,22 +33,132 @@ final class CodecOutputList extends AbstractList<Object> implements RandomAccess
     private static final Recycler<CodecOutputList> RECYCLER = new Recycler<CodecOutputList>() {
         @Override
         protected CodecOutputList newObject(Handle<CodecOutputList> handle) {
-            return new CodecOutputList(handle);
+            // Size of 16 should be good enough for 99 % of all users.
+            return new CodecOutputList(handle, 16);
         }
     };
 
+    private static final Recycler.Handle<CodecOutputList> NOOP_RECYCLER  = new Recycler.Handle<CodecOutputList>() {
+        @Override
+        public void recycle(CodecOutputList object) {
+            // drop on the floor
+        }
+    };
+
+    private static final FastThreadLocal<CodecOutputListPool> DEQUE_FAST_THREAD_LOCAL =
+            new FastThreadLocal<CodecOutputListPool>() {
+                @Override
+                protected CodecOutputListPool initialValue() throws Exception {
+                    return new DefaultCodecOutputListPool(8);
+                }
+            };
+
+    private static final FastThreadLocal<CodecOutputListPool> SPECIAL_POOL_FAST_THREAD_LOCAL =
+            new FastThreadLocal<CodecOutputListPool>() {
+                @Override
+                protected CodecOutputListPool initialValue() throws Exception {
+                    return new SpecialCodecOutputListPool(16);
+                }
+            };
+
+    static CodecOutputList newLocalInstance() {
+        return DEQUE_FAST_THREAD_LOCAL.get().get();
+    }
+
+    static CodecOutputList newLocalSpecialInstance() {
+        return SPECIAL_POOL_FAST_THREAD_LOCAL.get().get();
+    }
+
+    private interface CodecOutputListPool extends Recycler.Handle<CodecOutputList> {
+        CodecOutputList get();
+    }
+
+    private static final class DefaultCodecOutputListPool extends ArrayDeque<CodecOutputList>
+            implements CodecOutputListPool {
+
+        DefaultCodecOutputListPool(int numElements) {
+            super(numElements);
+            for (int i = 0; i < numElements; ++i) {
+                // Size of 16 should be good enough for 99 % of all users.
+                offerLast(new CodecOutputList(this, 16));
+            }
+        }
+
+        @Override
+        public CodecOutputList get() {
+            CodecOutputList outList = pollLast();
+            return outList == null ? newNonCachedInstance() : outList;
+        }
+
+        @Override
+        public void recycle(CodecOutputList object) {
+            offerLast(object);
+        }
+    }
+
+    private static final class SpecialCodecOutputListPool
+            implements CodecOutputListPool {
+
+        private final CodecOutputList[] elements;
+        private final int mask;
+
+        private int currentIdx;
+        private int count;
+
+        SpecialCodecOutputListPool(int numElements) {
+            elements = new CodecOutputList[MathUtil.safeFindNextPositivePowerOfTwo(numElements)];
+            for (int i = 0; i < elements.length; ++i) {
+                // Size of 16 should be good enough for 99 % of all users.
+                elements[i] = new CodecOutputList(this, 16);
+            }
+            count = elements.length;
+            currentIdx = elements.length;
+            mask = elements.length - 1;
+        }
+
+        @Override
+        public CodecOutputList get() {
+            if (count == 0) {
+                return newNonCachedInstance();
+            }
+            --count;
+
+            int idx = (currentIdx - 1) & mask;
+            CodecOutputList list = elements[idx];
+            currentIdx = idx;
+            return list;
+        }
+
+        @Override
+        public void recycle(CodecOutputList object) {
+            int idx = currentIdx;
+            elements[idx] = object;
+            currentIdx = (idx + 1) & mask;
+            ++count;
+            assert count <= elements.length;
+        }
+    }
+
     static CodecOutputList newInstance() {
+        return newLocalSpecialInstance();
+    }
+
+    static CodecOutputList newRecyclerInstance() {
         return RECYCLER.get();
+    }
+
+    static CodecOutputList newNonCachedInstance() {
+        return new CodecOutputList(NOOP_RECYCLER, 4);
     }
 
     private final Recycler.Handle<CodecOutputList> handle;
     private int size;
-    // Size of 16 should be good enough for 99 % of all users.
-    private Object[] array = new Object[16];
+    private Object[] array;
     private boolean insertSinceRecycled;
 
-    private CodecOutputList(Recycler.Handle<CodecOutputList> handle) {
+    private CodecOutputList(Recycler.Handle<CodecOutputList> handle, int size) {
         this.handle = handle;
+        array = new Object[size];
     }
 
     @Override
