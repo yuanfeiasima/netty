@@ -32,27 +32,9 @@ public class AdvancedCodecOutputListBenchmark extends AbstractMicrobenchmark {
     public int elements;
 
     @Benchmark
-    public boolean codecOutListRecycler() {
-        return benchmark(elements, CodecOutputList.newRecyclerInstance(), CodecOutputList.newRecyclerInstance(),
-                CodecOutputList.newRecyclerInstance(), CodecOutputList.newRecyclerInstance());
-    }
-
-    @Benchmark
-    public boolean codecOutListThreadLocal() {
-        return benchmark(elements, CodecOutputList.newLocalInstance(), CodecOutputList.newLocalInstance(),
-                CodecOutputList.newLocalInstance(), CodecOutputList.newLocalInstance());
-    }
-
-    @Benchmark
-    public boolean codecOutListSpecialThreadLocal() {
-        return benchmark(elements, CodecOutputList.newLocalSpecialInstance(), CodecOutputList.newLocalSpecialInstance(),
-                CodecOutputList.newLocalSpecialInstance(), CodecOutputList.newLocalSpecialInstance());
-    }
-
-    @Benchmark
-    public boolean codecOutListNonCached() {
-        return benchmark(elements, CodecOutputList.newNonCachedInstance(), CodecOutputList.newNonCachedInstance(),
-                CodecOutputList.newNonCachedInstance(), CodecOutputList.newNonCachedInstance());
+    public boolean codecOutListAllocRecycle() {
+        return benchmark(elements, CodecOutputList.newInstance(), CodecOutputList.newInstance(),
+                CodecOutputList.newInstance(), CodecOutputList.newInstance());
     }
 
     private static boolean benchmark(int elements, CodecOutputList list1, CodecOutputList list2,
