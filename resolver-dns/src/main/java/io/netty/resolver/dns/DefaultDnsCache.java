@@ -23,11 +23,15 @@ import io.netty.util.internal.UnstableApi;
 
 import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
@@ -39,8 +43,8 @@ import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
 @UnstableApi
 public class DefaultDnsCache implements DnsCache {
 
-    private final ConcurrentMap<String, List<DefaultDnsCacheEntry>> resolveCache =
-                                                            PlatformDependent.newConcurrentHashMap();
+    private final ConcurrentMap<String, Entries> resolveCache = PlatformDependent.newConcurrentHashMap();
+
     private final int minTtl;
     private final int maxTtl;
     private final int negativeTtl;
@@ -97,28 +101,30 @@ public class DefaultDnsCache implements DnsCache {
 
     @Override
     public void clear() {
-        for (Iterator<Map.Entry<String, List<DefaultDnsCacheEntry>>> i = resolveCache.entrySet().iterator();
+        for (Iterator<Map.Entry<String, Entries>> i = resolveCache.entrySet().iterator();
              i.hasNext();) {
-            final Map.Entry<String, List<DefaultDnsCacheEntry>> e = i.next();
+            final Map.Entry<String, Entries> e = i.next();
             i.remove();
-            cancelExpiration(e.getValue());
+
+            List<DefaultDnsCacheEntry> entryList = e.getValue().get();
+            if (entryList != null) {
+                cancelExpiration(entryList);
+            }
         }
     }
 
     @Override
     public boolean clear(String hostname) {
         checkNotNull(hostname, "hostname");
-        boolean removed = false;
-        for (Iterator<Map.Entry<String, List<DefaultDnsCacheEntry>>> i = resolveCache.entrySet().iterator();
-             i.hasNext();) {
-            final Map.Entry<String, List<DefaultDnsCacheEntry>> e = i.next();
-            if (e.getKey().equals(hostname)) {
-                i.remove();
-                cancelExpiration(e.getValue());
-                removed = true;
+        Entries entries = resolveCache.remove(hostname);
+        if (entries != null) {
+            List<DefaultDnsCacheEntry> entryList = entries.get();
+            if (entryList != null) {
+                cancelExpiration(entryList);
+                return true;
             }
         }
-        return removed;
+        return false;
     }
 
     private static boolean emptyAdditionals(DnsRecord[] additionals) {
@@ -131,20 +137,9 @@ public class DefaultDnsCache implements DnsCache {
         if (!emptyAdditionals(additionals)) {
             return null;
         }
-        return resolveCache.get(hostname);
-    }
 
-    private List<DefaultDnsCacheEntry> cachedEntries(String hostname) {
-        List<DefaultDnsCacheEntry> oldEntries = resolveCache.get(hostname);
-        final List<DefaultDnsCacheEntry> entries;
-        if (oldEntries == null) {
-            List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(8);
-            oldEntries = resolveCache.putIfAbsent(hostname, newEntries);
-            entries = oldEntries != null? oldEntries : newEntries;
-        } else {
-            entries = oldEntries;
-        }
-        return entries;
+        Entries entries = resolveCache.get(hostname);
+        return entries == null ? null : entries.get();
     }
 
     @Override
@@ -158,20 +153,17 @@ public class DefaultDnsCache implements DnsCache {
             return e;
         }
         final int ttl = Math.max(minTtl, (int) Math.min(maxTtl, originalTtl));
-        final List<DefaultDnsCacheEntry> entries = cachedEntries(hostname);
 
-        synchronized (entries) {
-            if (!entries.isEmpty()) {
-                final DefaultDnsCacheEntry firstEntry = entries.get(0);
-                if (firstEntry.cause() != null) {
-                    assert entries.size() == 1;
-                    firstEntry.cancelExpiration();
-                    entries.clear();
-                }
+        Entries entries = resolveCache.get(hostname);
+        if (entries == null) {
+            entries = resolveCache.putIfAbsent(hostname, new Entries(e));
+            if (entries == null) {
+                scheduleCacheExpiration(entries, e, negativeTtl, loop);
+                return e;
             }
-            entries.add(e);
         }
 
+        entries.add(e);
         scheduleCacheExpiration(entries, e, ttl, loop);
         return e;
     }
@@ -186,16 +178,16 @@ public class DefaultDnsCache implements DnsCache {
         if (negativeTtl == 0 || !emptyAdditionals(additionals)) {
             return e;
         }
-        final List<DefaultDnsCacheEntry> entries = cachedEntries(hostname);
 
-        synchronized (entries) {
-            final int numEntries = entries.size();
-            for (int i = 0; i < numEntries; i ++) {
-                entries.get(i).cancelExpiration();
+        Entries entries = resolveCache.get(hostname);
+        if (entries == null) {
+            entries = resolveCache.putIfAbsent(hostname, new Entries(e));
+            if (entries == null) {
+                scheduleCacheExpiration(entries, e, negativeTtl, loop);
+                return e;
             }
-            entries.clear();
-            entries.add(e);
         }
+        entries.add(e);
 
         scheduleCacheExpiration(entries, e, negativeTtl, loop);
         return e;
@@ -208,18 +200,15 @@ public class DefaultDnsCache implements DnsCache {
         }
     }
 
-    private void scheduleCacheExpiration(final List<DefaultDnsCacheEntry> entries,
+    private void scheduleCacheExpiration(final Entries entries,
                                          final DefaultDnsCacheEntry e,
                                          int ttl,
                                          EventLoop loop) {
         e.scheduleExpiration(loop, new Runnable() {
                     @Override
                     public void run() {
-                        synchronized (entries) {
-                            entries.remove(e);
-                            if (entries.isEmpty()) {
-                                resolveCache.remove(e.hostname());
-                            }
+                        if (entries.remove(e)) {
+                            resolveCache.remove(e.hostname);
                         }
                     }
                 }, ttl, TimeUnit.SECONDS);
@@ -286,6 +275,92 @@ public class DefaultDnsCache implements DnsCache {
                 return hostname + '/' + cause;
             } else {
                 return address.toString();
+            }
+        }
+    }
+
+    private static final class Entries {
+        private final ReadWriteLock lock = new ReentrantReadWriteLock();
+        private final Lock readLock = lock.readLock();
+        private final Lock writeLock = lock.writeLock();
+
+        // Access to this field is guarded by the ReadWriteLock.
+        //
+        // It's important that this List will never be modified itself but just replaced when an new entry is added,
+        // or removed.
+        private List<DefaultDnsCacheEntry> entries;
+
+        Entries(DefaultDnsCacheEntry entry) {
+            entries = Collections.unmodifiableList(Collections.singletonList(entry));
+        }
+
+        List<DefaultDnsCacheEntry> get() {
+            readLock.lock();
+            try {
+                return entries;
+            } finally {
+                readLock.unlock();
+            }
+        }
+
+        void add(DefaultDnsCacheEntry e) {
+            if (e.cause() == null) {
+                writeLock.lock();
+                try {
+                    if (!entries.isEmpty()) {
+                        final DefaultDnsCacheEntry firstEntry = entries.get(0);
+                        if (firstEntry.cause() != null) {
+                            assert entries.size() == 1;
+                            firstEntry.cancelExpiration();
+                            entries = Collections.unmodifiableList(Collections.singletonList(e));
+                            return;
+                        }
+                    }
+
+                    List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size() + 1);
+                    newEntries.addAll(entries);
+                    newEntries.add(e);
+                    entries = Collections.unmodifiableList(newEntries);
+                } finally {
+                    writeLock.unlock();
+                }
+            } else {
+                List<DefaultDnsCacheEntry> oldEntries;
+
+                writeLock.lock();
+                try {
+                    oldEntries = entries;
+                    entries = Collections.unmodifiableList(Collections.singletonList(e));
+                } finally {
+                    writeLock.unlock();
+                }
+                final int numEntries = oldEntries.size();
+
+                for (int i = 0; i < numEntries; i ++) {
+                    oldEntries.get(i).cancelExpiration();
+                }
+            }
+        }
+
+        boolean remove(DefaultDnsCacheEntry entry) {
+            writeLock.lock();
+            try {
+                List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size());
+                for (int i = 0; i < entries.size(); i++) {
+                    DefaultDnsCacheEntry e = entries.get(i);
+                    if (!e.equals(entry)) {
+                        newEntries.add(e);
+                    }
+                }
+                if (newEntries.isEmpty()) {
+                    entries = null;
+                    return true;
+                } else {
+                    entries = Collections.unmodifiableList(newEntries);
+                    return false;
+                }
+            } finally {
+                writeLock.unlock();
             }
         }
     }
