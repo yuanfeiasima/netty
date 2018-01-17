@@ -29,9 +29,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
@@ -106,10 +103,7 @@ public class DefaultDnsCache implements DnsCache {
             final Map.Entry<String, Entries> e = i.next();
             i.remove();
 
-            List<DefaultDnsCacheEntry> entryList = e.getValue().get();
-            if (entryList != null) {
-                cancelExpiration(entryList);
-            }
+            e.getValue().cancelExpiration();
         }
     }
 
@@ -117,14 +111,7 @@ public class DefaultDnsCache implements DnsCache {
     public boolean clear(String hostname) {
         checkNotNull(hostname, "hostname");
         Entries entries = resolveCache.remove(hostname);
-        if (entries != null) {
-            List<DefaultDnsCacheEntry> entryList = entries.get();
-            if (entryList != null) {
-                cancelExpiration(entryList);
-                return true;
-            }
-        }
-        return false;
+        return entries != null && entries.cancelExpiration();
     }
 
     private static boolean emptyAdditionals(DnsRecord[] additionals) {
@@ -135,11 +122,11 @@ public class DefaultDnsCache implements DnsCache {
     public List<? extends DnsCacheEntry> get(String hostname, DnsRecord[] additionals) {
         checkNotNull(hostname, "hostname");
         if (!emptyAdditionals(additionals)) {
-            return null;
+            return Collections.<DnsCacheEntry>emptyList();
         }
 
         Entries entries = resolveCache.get(hostname);
-        return entries == null ? null : entries.get();
+        return entries == null ? Collections.<DnsCacheEntry>emptyList() : entries.get();
     }
 
     @Override
@@ -152,19 +139,7 @@ public class DefaultDnsCache implements DnsCache {
         if (maxTtl == 0 || !emptyAdditionals(additionals)) {
             return e;
         }
-        final int ttl = Math.max(minTtl, (int) Math.min(maxTtl, originalTtl));
-
-        Entries entries = resolveCache.get(hostname);
-        if (entries == null) {
-            entries = resolveCache.putIfAbsent(hostname, new Entries(e));
-            if (entries == null) {
-                scheduleCacheExpiration(entries, e, negativeTtl, loop);
-                return e;
-            }
-        }
-
-        entries.add(e);
-        scheduleCacheExpiration(entries, e, ttl, loop);
+        cache0(e, Math.max(minTtl, (int) Math.min(maxTtl, originalTtl)), loop);
         return e;
     }
 
@@ -179,25 +154,22 @@ public class DefaultDnsCache implements DnsCache {
             return e;
         }
 
-        Entries entries = resolveCache.get(hostname);
-        if (entries == null) {
-            entries = resolveCache.putIfAbsent(hostname, new Entries(e));
-            if (entries == null) {
-                scheduleCacheExpiration(entries, e, negativeTtl, loop);
-                return e;
-            }
-        }
-        entries.add(e);
-
-        scheduleCacheExpiration(entries, e, negativeTtl, loop);
+        cache0(e, negativeTtl, loop);
         return e;
     }
 
-    private static void cancelExpiration(List<DefaultDnsCacheEntry> entries) {
-        final int numEntries = entries.size();
-        for (int i = 0; i < numEntries; i++) {
-            entries.get(i).cancelExpiration();
+    private void cache0(DefaultDnsCacheEntry e, int ttl, EventLoop loop) {
+        Entries entries = resolveCache.get(e.hostname());
+        if (entries == null) {
+            entries = new Entries(e);
+            Entries oldEntries = resolveCache.putIfAbsent(e.hostname(), entries);
+            if (oldEntries != null) {
+                entries = oldEntries;
+                entries.add(e);
+            }
         }
+
+        scheduleCacheExpiration(entries, e, ttl, loop);
     }
 
     private void scheduleCacheExpiration(final Entries entries,
@@ -280,71 +252,60 @@ public class DefaultDnsCache implements DnsCache {
     }
 
     private static final class Entries {
-        private final ReadWriteLock lock = new ReentrantReadWriteLock();
-        private final Lock readLock = lock.readLock();
-        private final Lock writeLock = lock.writeLock();
 
-        // Access to this field is guarded by the ReadWriteLock.
-        //
         // It's important that this List will never be modified itself but just replaced when an new entry is added,
-        // or removed.
-        private List<DefaultDnsCacheEntry> entries;
+        // or removed (COW semantics).
+        private volatile List<DefaultDnsCacheEntry> entries;
 
         Entries(DefaultDnsCacheEntry entry) {
             entries = Collections.unmodifiableList(Collections.singletonList(entry));
         }
 
         List<DefaultDnsCacheEntry> get() {
-            readLock.lock();
-            try {
-                return entries;
-            } finally {
-                readLock.unlock();
-            }
+            return entries;
         }
 
         void add(DefaultDnsCacheEntry e) {
             if (e.cause() == null) {
-                writeLock.lock();
-                try {
+                synchronized (this) {
+                    List<DefaultDnsCacheEntry> entries = this.entries;
                     if (!entries.isEmpty()) {
                         final DefaultDnsCacheEntry firstEntry = entries.get(0);
                         if (firstEntry.cause() != null) {
                             assert entries.size() == 1;
                             firstEntry.cancelExpiration();
-                            entries = Collections.unmodifiableList(Collections.singletonList(e));
+                            this.entries = Collections.unmodifiableList(Collections.singletonList(e));
                             return;
                         }
+                        List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size() + 1);
+                        newEntries.addAll(entries);
+                        newEntries.add(e);
+                        this.entries = Collections.unmodifiableList(newEntries);
+                    } else {
+                        this.entries = Collections.unmodifiableList(Collections.singletonList(e));
                     }
-
-                    List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size() + 1);
-                    newEntries.addAll(entries);
-                    newEntries.add(e);
-                    entries = Collections.unmodifiableList(newEntries);
-                } finally {
-                    writeLock.unlock();
                 }
             } else {
-                List<DefaultDnsCacheEntry> oldEntries;
-
-                writeLock.lock();
-                try {
-                    oldEntries = entries;
-                    entries = Collections.unmodifiableList(Collections.singletonList(e));
-                } finally {
-                    writeLock.unlock();
+                List<DefaultDnsCacheEntry> entries;
+                List<DefaultDnsCacheEntry> newEntries = Collections.unmodifiableList(Collections.singletonList(e));
+                synchronized (this) {
+                    entries = this.entries;
+                    this.entries = newEntries;
                 }
-                final int numEntries = oldEntries.size();
 
+                int numEntries = entries.size();
                 for (int i = 0; i < numEntries; i ++) {
-                    oldEntries.get(i).cancelExpiration();
+                    entries.get(i).cancelExpiration();
                 }
             }
         }
 
         boolean remove(DefaultDnsCacheEntry entry) {
-            writeLock.lock();
-            try {
+            synchronized (this) {
+                List<DefaultDnsCacheEntry> entries = this.entries;
+
+                // Just size the new ArrayList as before as we may not find the entry we are looking for and not
+                // want to cause an extra allocation / memory copy in this case.
                 List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size());
                 for (int i = 0; i < entries.size(); i++) {
                     DefaultDnsCacheEntry e = entries.get(i);
@@ -353,15 +314,30 @@ public class DefaultDnsCache implements DnsCache {
                     }
                 }
                 if (newEntries.isEmpty()) {
-                    entries = null;
+                    this.entries = Collections.emptyList();
                     return true;
                 } else {
-                    entries = Collections.unmodifiableList(newEntries);
+                    this.entries = Collections.unmodifiableList(newEntries);
                     return false;
                 }
-            } finally {
-                writeLock.unlock();
             }
+        }
+
+        boolean cancelExpiration() {
+            List<DefaultDnsCacheEntry> entries;
+            synchronized (this) {
+                entries = this.entries;
+                if (entries.isEmpty()) {
+                    return false;
+                }
+                this.entries = Collections.emptyList();
+            }
+
+            final int numEntries = entries.size();
+            for (int i = 0; i < numEntries; i++) {
+                entries.get(i).cancelExpiration();
+            }
+            return true;
         }
     }
 }
