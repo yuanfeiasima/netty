@@ -604,34 +604,24 @@ public class DnsNameResolver extends InetNameResolver {
             return false;
         }
 
-        InetAddress address = null;
-        Throwable cause = null;
-
-        if (cachedEntries.get(0).cause() != null) {
-            cause = cachedEntries.get(0).cause();
-        } else {
+        Throwable cause = cachedEntries.get(0).cause();
+        if (cause == null) {
             final int numEntries = cachedEntries.size();
             // Find the first entry with the preferred address type.
             for (InternetProtocolFamily f : resolvedInternetProtocolFamilies) {
                 for (int i = 0; i < numEntries; i++) {
                     final DnsCacheEntry e = cachedEntries.get(i);
                     if (f.addressType().isInstance(e.address())) {
-                        address = e.address();
-                        break;
+                        trySuccess(promise, e.address());
+                        return true;
                     }
                 }
             }
-        }
-
-        if (address != null) {
-            trySuccess(promise, address);
-            return true;
-        }
-        if (cause != null) {
+            return false;
+        } else {
             tryFailure(promise, cause);
             return true;
         }
-        return false;
     }
 
     private static <T> void trySuccess(Promise<T> promise, T result) {
@@ -731,12 +721,9 @@ public class DnsNameResolver extends InetNameResolver {
             return false;
         }
 
-        List<InetAddress> result = null;
-        Throwable cause = null;
-
-        if (cachedEntries.get(0).cause() != null) {
-            cause = cachedEntries.get(0).cause();
-        } else {
+        Throwable cause = cachedEntries.get(0).cause();
+        if (cause == null) {
+            List<InetAddress> result = null;
             final int numEntries = cachedEntries.size();
             for (InternetProtocolFamily f : resolvedInternetProtocolFamilies) {
                 for (int i = 0; i < numEntries; i++) {
@@ -749,17 +736,15 @@ public class DnsNameResolver extends InetNameResolver {
                     }
                 }
             }
-        }
-
-        if (result != null) {
-            trySuccess(promise, result);
-            return true;
-        }
-        if (cause != null) {
+            if (result != null) {
+                trySuccess(promise, result);
+                return true;
+            }
+            return false;
+        } else {
             tryFailure(promise, cause);
             return true;
         }
-        return false;
     }
 
     static final class ListResolverContext extends DnsNameResolverContext<List<InetAddress>> {

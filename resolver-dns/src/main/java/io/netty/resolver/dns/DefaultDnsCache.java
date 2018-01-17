@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
@@ -98,13 +99,15 @@ public class DefaultDnsCache implements DnsCache {
 
     @Override
     public void clear() {
-        for (Iterator<Map.Entry<String, Entries>> i = resolveCache.entrySet().iterator();
-             i.hasNext();) {
-            final Map.Entry<String, Entries> e = i.next();
-            i.remove();
+        do {
+            for (Iterator<Map.Entry<String, Entries>> i = resolveCache.entrySet().iterator();
+                 i.hasNext();) {
+                final Map.Entry<String, Entries> e = i.next();
+                i.remove();
 
-            e.getValue().cancelExpiration();
-        }
+                e.getValue().cancelExpiration();
+            }
+        } while (!resolveCache.isEmpty());
     }
 
     @Override
@@ -251,48 +254,42 @@ public class DefaultDnsCache implements DnsCache {
         }
     }
 
-    private static final class Entries {
-
-        // It's important that this List will never be modified itself but just replaced when an new entry is added,
-        // or removed (COW semantics).
-        private volatile List<DefaultDnsCacheEntry> entries;
+    // Directly extend AtomicReference for intrinsics and also to keep memory overhead low.
+    private static final class Entries extends AtomicReference<List<DefaultDnsCacheEntry>> {
 
         Entries(DefaultDnsCacheEntry entry) {
-            entries = Collections.unmodifiableList(Collections.singletonList(entry));
-        }
-
-        List<DefaultDnsCacheEntry> get() {
-            return entries;
+            super(Collections.singletonList(entry));
         }
 
         void add(DefaultDnsCacheEntry e) {
             if (e.cause() == null) {
-                synchronized (this) {
-                    List<DefaultDnsCacheEntry> entries = this.entries;
+                for (;;) {
+                    List<DefaultDnsCacheEntry> entries = get();
                     if (!entries.isEmpty()) {
                         final DefaultDnsCacheEntry firstEntry = entries.get(0);
                         if (firstEntry.cause() != null) {
                             assert entries.size() == 1;
-                            firstEntry.cancelExpiration();
-                            this.entries = Collections.unmodifiableList(Collections.singletonList(e));
-                            return;
+                            if (compareAndSet(entries, Collections.singletonList(e))) {
+                                firstEntry.cancelExpiration();
+                                return;
+                            } else {
+                                // Need to try again as CAS failed
+                                continue;
+                            }
                         }
+                        // Create a new List for COW semantics
                         List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size() + 1);
                         newEntries.addAll(entries);
                         newEntries.add(e);
-                        this.entries = Collections.unmodifiableList(newEntries);
-                    } else {
-                        this.entries = Collections.unmodifiableList(Collections.singletonList(e));
+                        if (compareAndSet(entries, newEntries)) {
+                            return;
+                        }
+                    } else if (compareAndSet(entries, Collections.singletonList(e))) {
+                        return;
                     }
                 }
             } else {
-                List<DefaultDnsCacheEntry> entries;
-                List<DefaultDnsCacheEntry> newEntries = Collections.unmodifiableList(Collections.singletonList(e));
-                synchronized (this) {
-                    entries = this.entries;
-                    this.entries = newEntries;
-                }
-
+                List<DefaultDnsCacheEntry> entries = getAndSet(Collections.singletonList(e));
                 int numEntries = entries.size();
                 for (int i = 0; i < numEntries; i ++) {
                     entries.get(i).cancelExpiration();
@@ -301,36 +298,40 @@ public class DefaultDnsCache implements DnsCache {
         }
 
         boolean remove(DefaultDnsCacheEntry entry) {
-            synchronized (this) {
-                List<DefaultDnsCacheEntry> entries = this.entries;
+            for (;;) {
+                List<DefaultDnsCacheEntry> entries = get();
 
-                // Just size the new ArrayList as before as we may not find the entry we are looking for and not
-                // want to cause an extra allocation / memory copy in this case.
-                List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size());
-                for (int i = 0; i < entries.size(); i++) {
-                    DefaultDnsCacheEntry e = entries.get(i);
-                    if (!e.equals(entry)) {
-                        newEntries.add(e);
+                if (entries.isEmpty()) {
+                    if (compareAndSet(entries, Collections.<DefaultDnsCacheEntry>emptyList())) {
+                        return false;
                     }
-                }
-                if (newEntries.isEmpty()) {
-                    this.entries = Collections.emptyList();
-                    return true;
                 } else {
-                    this.entries = Collections.unmodifiableList(newEntries);
-                    return false;
+                    // Just size the new ArrayList as before as we may not find the entry we are looking for and not
+                    // want to cause an extra allocation / memory copy in this case.
+                    List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size());
+                    for (int i = 0; i < entries.size(); i++) {
+                        DefaultDnsCacheEntry e = entries.get(i);
+                        if (!e.equals(entry)) {
+                            newEntries.add(e);
+                        }
+                    }
+                    if (newEntries.isEmpty()) {
+                        if (compareAndSet(entries, Collections.<DefaultDnsCacheEntry>emptyList())) {
+                            return true;
+                        }
+                    } else {
+                        if (compareAndSet(entries, Collections.unmodifiableList(newEntries))) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
 
         boolean cancelExpiration() {
-            List<DefaultDnsCacheEntry> entries;
-            synchronized (this) {
-                entries = this.entries;
-                if (entries.isEmpty()) {
-                    return false;
-                }
-                this.entries = Collections.emptyList();
+            List<DefaultDnsCacheEntry> entries = getAndSet(Collections.<DefaultDnsCacheEntry>emptyList());
+            if (entries.isEmpty()) {
+                return false;
             }
 
             final int numEntries = entries.size();
