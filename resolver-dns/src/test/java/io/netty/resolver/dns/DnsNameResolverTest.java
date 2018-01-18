@@ -1045,12 +1045,12 @@ public class DnsNameResolverTest {
             QuerySucceededEvent succeededEvent = (QuerySucceededEvent) observer.events.poll();
 
             if (cache) {
-                assertTrue(nsCache.cache.get("io.", null).isEmpty());
-                assertTrue(nsCache.cache.get("netty.io.", null).isEmpty());
+                assertNull(nsCache.cache.get("io.", null));
+                assertNull(nsCache.cache.get("netty.io.", null));
                 List<? extends DnsCacheEntry> entries = nsCache.cache.get("record.netty.io.", null);
                 assertEquals(1, entries.size());
 
-                assertTrue(nsCache.cache.get(hostname, null).isEmpty());
+                assertNull(nsCache.cache.get(hostname, null));
 
                 // Test again via cache.
                 resolver.resolveAll(hostname).syncUninterruptibly();
@@ -1255,9 +1255,7 @@ public class DnsNameResolverTest {
         @Override
         public List<? extends DnsCacheEntry> get(String hostname, DnsRecord[] additionals) {
             List<? extends DnsCacheEntry> cacheEntries = cache.get(hostname, additionals);
-            if (cacheEntries != null && !cacheEntries.isEmpty()) {
-                cacheHits.put(hostname, cacheEntries);
-            }
+            cacheHits.put(hostname, cacheEntries);
             return cacheEntries;
         }
 

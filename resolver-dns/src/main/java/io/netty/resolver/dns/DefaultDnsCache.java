@@ -99,15 +99,14 @@ public class DefaultDnsCache implements DnsCache {
 
     @Override
     public void clear() {
-        do {
-            for (Iterator<Map.Entry<String, Entries>> i = resolveCache.entrySet().iterator();
-                 i.hasNext();) {
+        while (!resolveCache.isEmpty()) {
+            for (Iterator<Map.Entry<String, Entries>> i = resolveCache.entrySet().iterator(); i.hasNext(); ) {
                 final Map.Entry<String, Entries> e = i.next();
                 i.remove();
 
                 e.getValue().cancelExpiration();
             }
-        } while (!resolveCache.isEmpty());
+        }
     }
 
     @Override
@@ -129,7 +128,7 @@ public class DefaultDnsCache implements DnsCache {
         }
 
         Entries entries = resolveCache.get(hostname);
-        return entries == null ? Collections.<DnsCacheEntry>emptyList() : entries.get();
+        return entries == null ? null : entries.get();
     }
 
     @Override
@@ -290,26 +289,27 @@ public class DefaultDnsCache implements DnsCache {
                 }
             } else {
                 List<DefaultDnsCacheEntry> entries = getAndSet(Collections.singletonList(e));
-                int numEntries = entries.size();
-                for (int i = 0; i < numEntries; i ++) {
-                    entries.get(i).cancelExpiration();
-                }
+                cancelExpiration(entries);
             }
         }
 
         boolean remove(DefaultDnsCacheEntry entry) {
             for (;;) {
                 List<DefaultDnsCacheEntry> entries = get();
-
-                if (entries.isEmpty()) {
+                int size = entries.size();
+                if (size == 0 || (size == 1 && entries.get(0).equals(entry))) {
+                    // If the list is empty we just return early and so not allocate a new ArrayList.
                     if (compareAndSet(entries, Collections.<DefaultDnsCacheEntry>emptyList())) {
                         return false;
                     }
                 } else {
                     // Just size the new ArrayList as before as we may not find the entry we are looking for and not
                     // want to cause an extra allocation / memory copy in this case.
-                    List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(entries.size());
-                    for (int i = 0; i < entries.size(); i++) {
+                    //
+                    // Its very likely we find the entry we are looking for so we directly create a new ArrayList
+                    // and fill it.
+                    List<DefaultDnsCacheEntry> newEntries = new ArrayList<DefaultDnsCacheEntry>(size);
+                    for (int i = 0; i < size; i++) {
                         DefaultDnsCacheEntry e = entries.get(i);
                         if (!e.equals(entry)) {
                             newEntries.add(e);
@@ -334,11 +334,15 @@ public class DefaultDnsCache implements DnsCache {
                 return false;
             }
 
-            final int numEntries = entries.size();
-            for (int i = 0; i < numEntries; i++) {
-                entries.get(i).cancelExpiration();
-            }
+            cancelExpiration(entries);
             return true;
+        }
+
+        private static void cancelExpiration(List<DefaultDnsCacheEntry> entryList) {
+            final int numEntries = entryList.size();
+            for (int i = 0; i < numEntries; i++) {
+                entryList.get(i).cancelExpiration();
+            }
         }
     }
 }
